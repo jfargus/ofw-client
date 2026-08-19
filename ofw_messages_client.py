@@ -8,9 +8,249 @@ from typing import Optional, List, Dict, Any
 import logging
 import json
 from pathlib import Path
+from dataclasses import dataclass, field
+import pandas as pd
+from ofw_browser_client import OFWBrowserClient
+from time import sleep
+from tqdm.auto import tqdm
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OFWMessageExtractor:
+    username: str
+    password: str
+    folder_id: Optional[int] = None
+    headless: bool = True
+    data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    message_client: Optional["OFWMessagesClient"] = None
+    late_night_start: int = 22
+    late_night_end: int = 6
+    backoff: float = 0.1
+
+    def __post_init__(self):
+        # Create messages client with auto auth
+        self.message_client = OFWMessagesClient()
+        if self.message_client.try_cached_token():
+            logging.info("\n✓ Using cached auth token (no browser needed!)")
+        else:
+            logging.info("\nNo valid cached token found. Need to login...")
+
+            logging.info("\nLogging in with browser...")
+
+            # Login with browser (headless)
+            with OFWBrowserClient(headless=True, debug_screenshots=True) as browser:
+                if not browser.login(self.username, self.password):
+                    logging.info("\n✗ Login failed. Check debug/ folder for details.")
+
+                logging.info("✓ Browser login successful!")
+
+                # Get localStorage and extract auth token
+                localstorage = browser.get_local_storage()
+
+                if not self.message_client.load_from_browser_client(
+                    browser, localstorage
+                ):
+                    logging.error("\n✗ Failed to authenticate with auth token")
+
+                logging.info("✓ Auth token retrieved and cached!")
+
+    def get_all_message_details(self, max_messages=None) -> pd.DataFrame:
+        """
+        Get all messages from the specified folder (or Inbox if None).
+
+        Args:
+            max_pages: Maximum number of pages to fetch (None = all pages)
+
+        Returns:
+            DataFrame with message details
+        """
+        max_pages = math.ceil(max_messages / 50) if max_messages else None
+        if max_pages:
+            logging.info(f"Fetching up to {max_messages} messages ({max_pages} pages)")
+        messages = self.message_client.get_all_messages(
+            max_pages=max_pages, folder_id=self.folder_id
+        )
+        messages_df = pd.DataFrame(messages)
+        messages_complete = pd.DataFrame()
+        for index, row in tqdm(
+            messages_df.iterrows(),
+            total=len(messages_df),
+            desc="Fetching messages",
+        ):
+            message_id = row["id"]
+
+            try:
+                messages_all = pd.DataFrame(
+                    self.message_client.get_message_reply_chain(message_id=message_id)
+                )
+                messages_all["base_message_id"] = message_id
+
+                messages_all["author_name"] = messages_all["author"].apply(
+                    lambda x: x["name"] if isinstance(x, dict) else x
+                )
+                messages_all["author_id"] = messages_all["author"].apply(
+                    lambda x: x["userId"] if isinstance(x, dict) else x
+                )
+                messages_all["recipient_name"] = messages_all["recipients"].apply(
+                    lambda x: x[0]["user"]["name"]
+                    if isinstance(x[0]["user"], dict)
+                    else x
+                )
+                messages_all["recipient_id"] = messages_all["recipients"].apply(
+                    lambda x: x[0]["user"]["userId"]
+                    if isinstance(x[0]["user"], dict)
+                    else x
+                )
+                messages_all["date_displayDate"] = messages_all["date"].apply(
+                    lambda x: x.get("displayDate") if isinstance(x, dict) else None
+                )
+                messages_all["date_displayTime"] = messages_all["date"].apply(
+                    lambda x: x.get("displayTime") if isinstance(x, dict) else None
+                )
+
+                messages_all = messages_all.drop(columns=["date"])
+
+                messages_all["message_datetime"] = pd.to_datetime(
+                    messages_all["date_displayDate"]
+                    + " "
+                    + messages_all["date_displayTime"],
+                    format="%m/%d/%Y %I:%M %p",
+                )
+
+                messages_all = messages_all.drop(
+                    columns=["date_displayDate", "date_displayTime"]
+                )
+
+                messages_all["base_context"] = messages_all.apply(
+                    lambda row: (
+                        f"Message ID: {row['id']}\n"
+                        f"Author: {row['author_name']}\n"
+                        f"Recipient: {row['recipient_name']}\n"
+                        f"Date: {row['message_datetime']}\n"
+                        f"Subject: {row['subject']}\n"
+                        f"Body: {row['body']}"
+                    ),
+                    axis=1,
+                )
+
+                rollup = (
+                    messages_all.groupby("base_message_id")["base_context"]
+                    .apply(lambda x: "\n\n".join(x))
+                    .reset_index()
+                )
+
+                sleep(self.backoff)
+
+                message_details = pd.DataFrame(
+                    [self.message_client.get_message(message_id=message_id)]
+                )
+
+                result_df = pd.merge(
+                    rollup,
+                    message_details,
+                    left_on="base_message_id",
+                    right_on="id",
+                )
+
+                messages_complete = pd.concat(
+                    [messages_complete, result_df],
+                    ignore_index=True,
+                )
+
+            except Exception as e:
+                message_details = pd.DataFrame(
+                    [self.message_client.get_message(message_id=message_id)]
+                )
+
+                messages_complete = pd.concat(
+                    [messages_complete, message_details],
+                    ignore_index=True,
+                )
+
+            sleep(self.backoff)
+        add_message_fields_df = self.add_message_fields(messages_complete)
+        self.data = add_message_fields_df
+        return add_message_fields_df
+
+    def add_message_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add additional fields to the DataFrame.
+
+        Args:
+            df: DataFrame with message details
+
+        Returns:
+            DataFrame with additional fields
+        """
+        messages_df = df
+
+        def get_first_recipient_info(recipients_list, key):
+            if isinstance(recipients_list, list) and len(recipients_list) > 0:
+                first_recipient = recipients_list[0]
+                if isinstance(first_recipient, dict) and "user" in first_recipient:
+                    user_info = first_recipient["user"]
+                    return user_info.get(key)
+            return None
+
+        messages_df["author_userId"] = messages_df["author"].apply(
+            lambda x: x.get("userId") if isinstance(x, dict) else None
+        )
+        messages_df["author_name"] = messages_df["author"].apply(
+            lambda x: x.get("name") if isinstance(x, dict) else None
+        )
+        messages_df = messages_df.drop(columns=["author"])
+        messages_df["date_displayDate"] = messages_df["date"].apply(
+            lambda x: x.get("displayDate") if isinstance(x, dict) else None
+        )
+        messages_df["date_displayTime"] = messages_df["date"].apply(
+            lambda x: x.get("displayTime") if isinstance(x, dict) else None
+        )
+        messages_df = messages_df.drop(columns=["date"])
+        messages_df["message_datetime"] = pd.to_datetime(
+            messages_df["date_displayDate"] + " " + messages_df["date_displayTime"],
+            format="%m/%d/%Y %I:%M %p",
+        )
+        messages_df = messages_df.drop(columns=["date_displayDate", "date_displayTime"])
+        # Recreate a temporary dataframe with just the original 'recipients' column for flattening
+        messages_df["recipient_primary"] = messages_df["recipients"].apply(
+            lambda x: get_first_recipient_info(x, "name")
+        )
+
+        # add calculated fields
+        late_night_start = self.late_night_start
+        late_night_end = self.late_night_end
+
+        ## #@param {type:"integer"}
+        ###@param {type:"integer"}
+
+        messages_df["is_late_night"] = (
+            messages_df["message_datetime"].dt.hour.between(late_night_start, 23)
+        ) | (messages_df["message_datetime"].dt.hour.between(0, late_night_end))
+        messages_df["character_count"] = messages_df["body"].str.len()
+
+        if "base_context" not in messages_df.columns:
+            messages_df["base_context"] = None
+
+        messages_final_output = messages_df[
+            [
+                "id",
+                "subject",
+                "author_userId",
+                "author_name",
+                "recipient_primary",
+                "message_datetime",
+                "body",
+                "inReplyTo",
+                "base_context",
+                "is_late_night",
+                "character_count",
+            ]
+        ]
+        return messages_final_output
 
 
 class OFWMessagesClient:
